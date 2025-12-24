@@ -19,6 +19,7 @@ import comfy.model_management as mm
 from comfy.utils import ProgressBar
 from comfy.cli_args import args, LatentPreviewMethod
 from ..nodes_model_loading import load_weights
+from accelerate import dispatch_model
 from ..nodes_sampler import offload_transformer, init_blockswap
 from ..custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
 
@@ -147,6 +148,7 @@ class WanVideoDiffusionForcingSampler:
         patcher = model
         model = model.model
         transformer = model.diffusion_model
+        device = model.get("multi_gpu_device", device)
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
@@ -174,8 +176,21 @@ class WanVideoDiffusionForcingSampler:
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0:
             transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
             transformer.patched_linear = True
+        device_map = model.get("device_map", None)
         if patcher.model["sd"] is not None and gguf_reader is None:
-            load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
+            load_weights(
+                patcher.model.diffusion_model,
+                patcher.model["sd"],
+                weight_dtype,
+                base_dtype=dtype,
+                transformer_load_device=device,
+                block_swap_args=block_swap_args,
+                device_map=device_map,
+            )
+            if device_map is not None and not model.get("multi_gpu_dispatched", False):
+                transformer = dispatch_model(transformer, device_map=device_map)
+                patcher.model.diffusion_model = transformer
+                model["multi_gpu_dispatched"] = True
 
         if gguf_reader is not None: #handle GGUF
             load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
