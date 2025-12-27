@@ -13,6 +13,7 @@ from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 from .custom_linear import _replace_linear
 
 from accelerate import init_empty_weights
+from accelerate.utils import get_balanced_memory, infer_auto_device_map
 from .utils import set_module_tensor_to_device
 
 import folder_paths
@@ -801,8 +802,72 @@ def rename_fuser_block(name):
             new_name = name.replace(f"face_adapter.fuser_blocks.{fuser_block_num}.", f"blocks.{main_block_num}.fuser_block.")
     return new_name
 
+def resolve_device_map_device(name, device_map, fallback_device):
+    if not device_map:
+        return fallback_device
+    best_key = None
+    for key in device_map.keys():
+        if key == "":
+            if best_key is None:
+                best_key = key
+            continue
+        if name == key or name.startswith(f"{key}."):
+            if best_key is None or len(key) > len(best_key):
+                best_key = key
+    return device_map[best_key] if best_key is not None else fallback_device
+
+def parse_gpu_ids(gpu_ids):
+    if gpu_ids is None:
+        return None
+    if isinstance(gpu_ids, (list, tuple)):
+        return [int(x) for x in gpu_ids]
+    gpu_ids = str(gpu_ids).strip()
+    if not gpu_ids:
+        return None
+    ids = []
+    for part in gpu_ids.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            ids.extend(range(int(start), int(end) + 1))
+        else:
+            ids.append(int(part))
+    return sorted(set(ids))
+
+def infer_wan_device_map(transformer, base_dtype, multi_gpu_mode, gpu_ids=None):
+    if torch.cuda.device_count() < 2:
+        log.warning("Multi-GPU mode requested but only one CUDA device is available.")
+        return None
+    no_split_module_classes = ["WanAttentionBlock", "VaceWanAttentionBlock", "BaseWanAttentionBlock"]
+    low_zero = multi_gpu_mode == "accelerate_balanced"
+    max_memory = get_balanced_memory(
+        transformer,
+        dtype=base_dtype,
+        low_zero=low_zero,
+        no_split_module_classes=no_split_module_classes,
+    )
+    gpu_ids = parse_gpu_ids(gpu_ids)
+    if gpu_ids:
+        filtered = {}
+        for gpu_id in gpu_ids:
+            if f"cuda:{gpu_id}" in max_memory or gpu_id in max_memory:
+                filtered[f"cuda:{gpu_id}"] = max_memory.get(f"cuda:{gpu_id}", max_memory.get(gpu_id))
+        max_memory = filtered
+    if isinstance(offload_device, torch.device) and offload_device.type == "cpu":
+        max_memory.setdefault("cpu", "64GiB")
+    device_map = infer_auto_device_map(
+        transformer,
+        dtype=base_dtype,
+        max_memory=max_memory,
+        no_split_module_classes=no_split_module_classes,
+    )
+    return device_map
+
 def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
-                 transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None, compile_args=None):
+                 transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None,
+                 compile_args=None, device_map=None):
     params_to_keep = {"time_in", "patch_embedding", "time_", "modulation", "text_embedding",
                       "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer", "audio_proj_glob", "face_encoder", "fuser_block"}
     param_count = sum(1 for _ in transformer.named_parameters())
@@ -915,6 +980,8 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             elif vace_block_idx is not None:
                 if vace_block_idx >= len(transformer.vace_blocks) - block_swap_args.get("vace_blocks_to_swap", 0):
                     load_device = offload_device
+        if device_map is not None and not gguf:
+            load_device = resolve_device_map_device(key, device_map, load_device)
         # Set tensor to device
         set_module_tensor_to_device(transformer, name, device=load_device, dtype=dtype_to_use, value=value)
         cnt += 1
@@ -1040,6 +1107,8 @@ class WanVideoModelLoader:
                 "multitalk_model": ("MULTITALKMODEL", {"default": None, "tooltip": "Multitalk model"}),
                 "fantasyportrait_model": ("FANTASYPORTRAITMODEL", {"default": None, "tooltip": "FantasyPortrait model"}),
                 "rms_norm_function": (["default", "pytorch"], {"default": "default", "tooltip": "RMSNorm function to use, 'pytorch' is the new native torch RMSNorm, which is faster (when not using torch.compile mostly) but changes results slightly. 'default' is the original WanRMSNorm"}),
+                "multi_gpu": (["disabled", "accelerate_auto", "accelerate_balanced"], {"default": "disabled", "tooltip": "Use HuggingFace Accelerate to shard the model across multiple GPUs for inference. 'accelerate_balanced' attempts to balance across GPUs and keep GPU0 lighter."}),
+                "gpu_ids": ("STRING", {"default": "", "multiline": False, "tooltip": "Optional comma-separated CUDA device IDs (e.g. '0,1' or '2-3') to use for multi-GPU sharding. Leave empty to use all available GPUs."}),
             }
         }
 
@@ -1050,7 +1119,7 @@ class WanVideoModelLoader:
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, extra_model=None, vace_model=None,
-                  fantasytalking_model=None, multitalk_model=None, fantasyportrait_model=None, rms_norm_function="default"):
+                  fantasytalking_model=None, multitalk_model=None, fantasyportrait_model=None, rms_norm_function="default", multi_gpu="disabled", gpu_ids=""):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
         if vace_model is not None:
             extra_model = vace_model
@@ -1078,6 +1147,21 @@ class WanVideoModelLoader:
             gguf = True
             if merge_loras is True:
                 raise ValueError("GGUF models do not support LoRA merging, please disable merge_loras in the LoRA select node.")
+            if multi_gpu != "disabled":
+                raise ValueError("Multi-GPU accelerate sharding is not supported for GGUF models.")
+
+        if multi_gpu != "disabled":
+            if block_swap_args is not None or vram_management_args is not None:
+                raise ValueError("Multi-GPU accelerate sharding is not compatible with block swapping or VRAM management.")
+            if merge_loras and lora is not None:
+                raise ValueError("Multi-GPU accelerate sharding is not compatible with merged LoRAs.")
+            if compile_args is not None:
+                log.warning("Multi-GPU accelerate sharding may not be compatible with torch.compile; disable compile if you see issues.")
+            selected_gpu_ids = parse_gpu_ids(gpu_ids)
+            if selected_gpu_ids is not None:
+                for gpu_id in selected_gpu_ids:
+                    if gpu_id < 0 or gpu_id >= torch.cuda.device_count():
+                        raise ValueError(f"gpu_ids contains invalid CUDA device id: {gpu_id}")
 
         transformer_load_device = device if load_device == "main_device" else offload_device
         if lora is not None and not merge_loras:
@@ -1655,10 +1739,23 @@ class WanVideoModelLoader:
                 sd.update(unianimate_sd)
                 del unianimate_sd
 
+        device_map = None
+        if multi_gpu != "disabled":
+            device_map = infer_wan_device_map(transformer, base_dtype, multi_gpu, gpu_ids=gpu_ids)
+            if device_map is not None:
+                log.info(f"Accelerate device_map generated for multi-GPU sharding.")
+
         if not gguf:
             if lora is not None and merge_loras:
                 if not lora_low_mem_load:
-                    load_weights(transformer, sd, weight_dtype, base_dtype, transformer_load_device)
+                    load_weights(
+                        transformer,
+                        sd,
+                        weight_dtype,
+                        base_dtype,
+                        transformer_load_device,
+                        device_map=device_map,
+                    )
 
                 if control_lora:
                     patch_control_lora(patcher.model.diffusion_model, device)
@@ -1745,6 +1842,10 @@ class WanVideoModelLoader:
         patcher.model["scale_weights"] = scale_weights
         patcher.model["sd"] = sd
         patcher.model["lora"] = lora
+        patcher.model["device_map"] = device_map
+        patcher.model["multi_gpu"] = multi_gpu
+        patcher.model["multi_gpu_dispatched"] = False
+        patcher.model["multi_gpu_device"] = torch.device(device_map[""] if device_map and "" in device_map else device)
 
         if 'transformer_options' not in patcher.model_options:
             patcher.model_options['transformer_options'] = {}
