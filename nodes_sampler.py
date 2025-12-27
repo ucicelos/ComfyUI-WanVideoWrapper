@@ -15,6 +15,7 @@ from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scal
                    compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling)
 from .cache_methods.cache_methods import cache_report
 from .nodes_model_loading import load_weights
+from accelerate import dispatch_model
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .WanMove.trajectory import replace_feature
 from contextlib import nullcontext
@@ -163,6 +164,7 @@ class WanVideoSampler:
         patcher = model
         model = model.model
         transformer = model.diffusion_model
+        device = model.get("multi_gpu_device", device)
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
@@ -198,9 +200,22 @@ class WanVideoSampler:
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and gguf_reader is None:
             transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
             transformer.patched_linear = True
+        device_map = model.get("device_map", None)
         if patcher.model["sd"] is not None and gguf_reader is None:
-            load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
-                         block_swap_args=block_swap_args, compile_args=model["compile_args"])
+            load_weights(
+                patcher.model.diffusion_model,
+                patcher.model["sd"],
+                weight_dtype,
+                base_dtype=dtype,
+                transformer_load_device=device,
+                block_swap_args=block_swap_args,
+                compile_args=model["compile_args"],
+                device_map=device_map,
+            )
+            if device_map is not None and not model.get("multi_gpu_dispatched", False):
+                transformer = dispatch_model(transformer, device_map=device_map)
+                patcher.model.diffusion_model = transformer
+                model["multi_gpu_dispatched"] = True
 
         if gguf_reader is not None: #handle GGUF
             load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True,
@@ -2481,7 +2496,15 @@ class WanVideoSampler:
                             if offloaded:
                                 # Load weights
                                 if transformer.patched_linear and gguf_reader is None:
-                                    load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
+                                    load_weights(
+                                        patcher.model.diffusion_model,
+                                        patcher.model["sd"],
+                                        weight_dtype,
+                                        base_dtype=dtype,
+                                        transformer_load_device=device,
+                                        block_swap_args=block_swap_args,
+                                        device_map=device_map,
+                                    )
                                 elif gguf_reader is not None: #handle GGUF
                                     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
                                 #blockswap init
@@ -3008,7 +3031,15 @@ class WanVideoSampler:
                             if offloaded:
                                 # Load weights
                                 if transformer.patched_linear and gguf_reader is None:
-                                    load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
+                                    load_weights(
+                                        patcher.model.diffusion_model,
+                                        patcher.model["sd"],
+                                        weight_dtype,
+                                        base_dtype=dtype,
+                                        transformer_load_device=device,
+                                        block_swap_args=block_swap_args,
+                                        device_map=device_map,
+                                    )
                                 elif gguf_reader is not None: #handle GGUF
                                     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
                                 #blockswap init
