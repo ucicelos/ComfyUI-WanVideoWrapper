@@ -836,6 +836,18 @@ def parse_gpu_ids(gpu_ids):
             ids.append(int(part))
     return sorted(set(ids))
 
+def normalize_device_key(device_key):
+    if isinstance(device_key, int):
+        return device_key
+    if isinstance(device_key, torch.device):
+        if device_key.type == "cuda" and device_key.index is not None:
+            return device_key.index
+        return str(device_key)
+    device_str = str(device_key)
+    if device_str.startswith("cuda:"):
+        return int(device_str.split("cuda:", 1)[1])
+    return device_str
+
 def infer_wan_device_map(transformer, base_dtype, multi_gpu_mode, gpu_ids=None):
     if torch.cuda.device_count() < 2:
         log.warning("Multi-GPU mode requested but only one CUDA device is available.")
@@ -853,7 +865,7 @@ def infer_wan_device_map(transformer, base_dtype, multi_gpu_mode, gpu_ids=None):
         filtered = {}
         for gpu_id in gpu_ids:
             if f"cuda:{gpu_id}" in max_memory or gpu_id in max_memory:
-                filtered[f"cuda:{gpu_id}"] = max_memory.get(f"cuda:{gpu_id}", max_memory.get(gpu_id))
+                filtered[gpu_id] = max_memory.get(f"cuda:{gpu_id}", max_memory.get(gpu_id))
         max_memory = filtered
     if isinstance(offload_device, torch.device) and offload_device.type == "cpu":
         max_memory.setdefault("cpu", "64GiB")
@@ -1845,7 +1857,11 @@ class WanVideoModelLoader:
         patcher.model["device_map"] = device_map
         patcher.model["multi_gpu"] = multi_gpu
         patcher.model["multi_gpu_dispatched"] = False
-        patcher.model["multi_gpu_device"] = torch.device(device_map[""] if device_map and "" in device_map else device)
+        if device_map and "" in device_map:
+            primary_key = normalize_device_key(device_map[""])
+            patcher.model["multi_gpu_device"] = torch.device(f"cuda:{primary_key}") if isinstance(primary_key, int) else torch.device(primary_key)
+        else:
+            patcher.model["multi_gpu_device"] = device
 
         if 'transformer_options' not in patcher.model_options:
             patcher.model_options['transformer_options'] = {}
